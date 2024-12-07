@@ -10,13 +10,12 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import datetime
 from dateutil import parser
-from pytz import timezone
+from pytz import timezone, utc
 import matplotlib.pyplot as plt
 import io
 import os
 from dotenv import load_dotenv
 load_dotenv()
-
 
 token = os.getenv("TELEGRAM_TOKEN")
 creds_file = os.getenv("GOOGLE_CLIENT_SECRET_FILE")
@@ -49,13 +48,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [KeyboardButton("📖 Расписание на день"), KeyboardButton("🚫 Отмена")]
     ]
     reply_markup = ReplyKeyboardMarkup(menu_buttons, resize_keyboard=True)
-    await update.message.reply_text(
-        "Выберите действие:",
-        reply_markup=reply_markup
-    )
+    await update.message.reply_text("Выберите действие:", reply_markup=reply_markup)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Операция отменена.")
+    context.user_data.clear()
+    await update.message.reply_text("Действие отменено.")
     return ConversationHandler.END
 
 async def add_event_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -120,9 +117,7 @@ async def create_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         attendees = [{'email': email.strip()} for email in context.user_data['attendees'].split(',') if email.strip()]
         description = context.user_data.get('description', '')
 
-        # Проверка пересечения с уже существующими событиями
-        if await check_event_overlap(start_datetime, end_datetime, attendees):
-            # Есть пересечение, спрашиваем подтверждение
+        if await check_event_overlap(start_datetime, end_datetime, [a['email'] for a in attendees]):
             context.user_data['pending_event'] = {
                 'summary': context.user_data['title'],
                 'description': description,
@@ -158,9 +153,11 @@ async def create_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             notification_time = start_datetime - datetime.timedelta(minutes=5)
             now = datetime.datetime.now(local_tz)
             if notification_time > now:
+                # Преобразуем время в UTC для корректной работы run_once
+                notification_time_utc = notification_time.astimezone(utc)
                 context.job_queue.run_once(
                     send_event_notification,
-                    when=notification_time,
+                    when=notification_time_utc,
                     data={
                         'chat_id': update.effective_chat.id,
                         'title': context.user_data['title'],
@@ -175,8 +172,6 @@ async def create_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return ConversationHandler.END
 
 async def check_event_overlap(start_dt, end_dt, attendees_emails):
-    # Проверяем пересечения для всех участников
-    # Чтобы учесть всех, делаем freebusy запрос для всех участников.
     items = [{'id': 'primary'}]
     for em in attendees_emails:
         items.append({'id': em})
@@ -191,7 +186,6 @@ async def check_event_overlap(start_dt, end_dt, attendees_emails):
     freebusy_result = calendar_service.freebusy().query(body=body).execute()
     calendars = freebusy_result.get('calendars', {})
 
-    # Если на этом интервале у кого-то есть busy, значит пересечение есть.
     for cal_id, data in calendars.items():
         if data.get('busy', []):
             return True
@@ -222,6 +216,23 @@ async def confirm_overlap(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         }
         created_event = calendar_service.events().insert(calendarId='primary', body=event_body).execute()
         await query.edit_message_text(f"Событие создано: {created_event.get('htmlLink', 'Нет ссылки')}")
+
+        # Добавляем уведомление 5 минут
+        notification_time = pending_event['start'] - datetime.timedelta(minutes=5)
+        now = datetime.datetime.now(local_tz)
+        if notification_time > now:
+            notification_time_utc = notification_time.astimezone(utc)
+            await query.bot.send_message(chat_id=query.message.chat_id, text="Напоминание за 5 минут до встречи будет отправлено.")
+            query._application.job_queue.run_once(
+                send_event_notification,
+                when=notification_time_utc,
+                data={
+                    'chat_id': query.message.chat_id,
+                    'title': pending_event['summary'],
+                    'time': pending_event['start'].strftime('%H:%M')
+                },
+                name=f"event_notification_{created_event['id']}"
+            )
     else:
         await query.edit_message_text("Создание события отменено.")
     return ConversationHandler.END
@@ -372,7 +383,6 @@ async def find_time_process(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         attendees_emails = [email.strip() for email in context.user_data['attendees'].split(',') if email.strip()]
 
-        # Собираем все календари (включая свой) для проверки
         items = [{"id": 'primary'}]
         for em in attendees_emails:
             items.append({"id": em})
@@ -387,12 +397,10 @@ async def find_time_process(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         freebusy_result = calendar_service.freebusy().query(body=body).execute()
         calendars = freebusy_result.get('calendars', {})
 
-        # Собираем занятое время всех участников
         busy_times = []
         for cal_id in calendars:
             busy_times.extend(calendars[cal_id].get('busy', []))
 
-        # Объединяем занятые интервалы
         busy_times = sorted(busy_times, key=lambda x: x['start'])
         merged_busy_times = []
         for busy in busy_times:
@@ -403,7 +411,6 @@ async def find_time_process(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             else:
                 merged_busy_times[-1]['end'] = max(merged_busy_times[-1]['end'], busy_end)
 
-        # Ищем свободные слоты - те, которые не пересекаются ни с одним занятым интервалом
         free_slots = []
         current_time = start_datetime
         while current_time + duration <= end_datetime:
@@ -448,7 +455,6 @@ async def select_time_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     end_time = selected_slot[1]
     attendees = [{'email': email} for email in context.user_data['attendees_emails']]
 
-    # Проверяем еще раз пересечение перед созданием (на случай изменения)
     if await check_event_overlap(start_time, end_time, context.user_data['attendees_emails']):
         context.user_data['pending_event'] = {
             'summary': 'Встреча',
@@ -480,6 +486,22 @@ async def select_time_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         }
         created_event = calendar_service.events().insert(calendarId='primary', body=event).execute()
         await query.edit_message_text(f"Встреча создана: {created_event.get('htmlLink', 'Нет ссылки')}")
+
+        # Добавляем уведомление за 5 минут
+        notification_time = start_time - datetime.timedelta(minutes=5)
+        now = datetime.datetime.now(local_tz)
+        if notification_time > now:
+            notification_time_utc = notification_time.astimezone(utc)
+            query._application.job_queue.run_once(
+                send_event_notification,
+                when=notification_time_utc,
+                data={
+                    'chat_id': query.message.chat_id,
+                    'title': 'Встреча',
+                    'time': start_time.strftime('%H:%M')
+                },
+                name=f"event_notification_{created_event['id']}"
+            )
         return ConversationHandler.END
 
 async def stats_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
